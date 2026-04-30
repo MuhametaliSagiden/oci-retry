@@ -219,6 +219,17 @@ def main() -> int:
         ad = candidates[(attempt - 1) % len(candidates)]
         log.info("Attempt %d in AD=%s", attempt, ad)
 
+        def _sleep_bounded(base_delay: int) -> None:
+            """Sleep `base_delay` seconds, but no longer than remaining runtime budget."""
+            if MAX_RUNTIME_SECONDS:
+                remaining = MAX_RUNTIME_SECONDS - (time.time() - started)
+                if remaining <= 0:
+                    return
+                actual = min(base_delay, int(remaining) + 1)
+            else:
+                actual = base_delay
+            time.sleep(actual)
+
         try:
             response = compute.launch_instance(build_launch_details(ad))
             inst = response.data
@@ -239,10 +250,10 @@ def main() -> int:
             if is_out_of_capacity(e):
                 delay = random.randint(MIN_DELAY, MAX_DELAY)
                 log.warning("AD=%s out of capacity. Sleep %ds.", ad, delay)
-                time.sleep(delay)
+                _sleep_bounded(delay)
             elif is_too_many_requests(e):
                 log.warning("429 TooManyRequests. Sleep %ds.", TOO_MANY_REQUESTS_DELAY)
-                time.sleep(TOO_MANY_REQUESTS_DELAY)
+                _sleep_bounded(TOO_MANY_REQUESTS_DELAY)
             elif is_limit_exceeded(e):
                 log.error(
                     "Tenancy limit reached (%s). Reduce OCPU/memory or delete unused A1 instances.",
@@ -262,7 +273,7 @@ def main() -> int:
                     "Unhandled ServiceError: status=%s code=%s message=%s — sleeping 60s",
                     e.status, e.code, e.message,
                 )
-                time.sleep(60)
+                _sleep_bounded(60)
 
         except KeyboardInterrupt:
             log.info("Interrupted.")
@@ -270,7 +281,7 @@ def main() -> int:
 
         except Exception:  # noqa: BLE001
             log.exception("Unexpected error; sleeping 60s before retry")
-            time.sleep(60)
+            _sleep_bounded(60)
 
 
 if __name__ == "__main__":
