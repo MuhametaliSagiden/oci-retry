@@ -1,33 +1,41 @@
-name: OCI ARM retry
+name: OCI capacity hunter
 
-# Запускается каждые 10 минут. Каждый запуск делает попытки в течение
-# ~8 минут (MAX_RUNTIME_SECONDS=480), затем мягко выходит, если ёмкости нет.
-# При успехе — Telegram-уведомление и инстанс уже у тебя в OCI.
+# Каждый запуск ломится в OCI ~8 минут, потом мягко выходит и ждёт следующего тика.
+# При успехе workflow сам себя отключает, чтобы не жечь минуты Actions впустую.
+#
+# ВАЖНО про минуты: в приватном репозитории бесплатно 2000 минут/месяц, и
+# расписание ниже (*/15) съест их за пару дней. Варианты:
+#   * сделать репозиторий публичным -> минуты Actions не тарифицируются вообще;
+#   * либо оставить приватным и поменять cron на "0 */4 * * *".
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
-# Не запускать параллельно несколько раннеров — они начнут перетягивать капасити друг у друга.
+# Параллельные раннеры перетягивали бы капасити друг у друга.
 concurrency:
-  group: oci-arm-retry
+  group: oci-capacity-hunter
   cancel-in-progress: false
 
 jobs:
-  retry:
+  hunt:
     runs-on: ubuntu-latest
     timeout-minutes: 9
+    permissions:
+      actions: write
+      contents: read
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
 
       - run: pip install -r requirements.txt
 
-      - name: Set up OCI config
+      - name: Собрать ~/.oci/config из секретов
         env:
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
@@ -35,6 +43,7 @@ jobs:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
@@ -47,45 +56,53 @@ jobs:
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
 
-      - name: Try launch
+      - name: Ловить инстанс
+        id: hunt
         env:
+          # --- OCI ---
           OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
-          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-          OCI_OCPUS: "4"
-          OCI_MEMORY_GB: "24"
+          # Always Free ARM с 15.06.2026 -- 2 OCPU / 12 GB (было 4/24).
+          # Можно дописать fallback: "VM.Standard.A1.Flex:2:12,VM.Standard.E2.1.Micro:1:1"
+          OCI_SHAPE_PLAN: ${{ vars.OCI_SHAPE_PLAN || 'VM.Standard.A1.Flex:2:12' }}
           OCI_BOOT_VOLUME_GB: "100"
-          OCI_DISPLAY_NAME: atm10-arm
-          # Уложиться в timeout-minutes (9) с запасом
+          OCI_DISPLAY_NAME: torrserver
+          # --- TorrServer / домен ---
+          DUCKDNS_SUBDOMAIN: ${{ secrets.DUCKDNS_SUBDOMAIN }}
+          DUCKDNS_TOKEN: ${{ secrets.DUCKDNS_TOKEN }}
+          TS_DOMAIN: ${{ vars.TS_DOMAIN }}
+          TS_USER: ${{ secrets.TS_USER }}
+          TS_PASS: ${{ secrets.TS_PASS }}
+          TS_CACHE_GB: "2"
+          TS_PEER_PORT: "32000"
+          # --- тайминги: уложиться в timeout-minutes с запасом ---
           MAX_RUNTIME_SECONDS: "480"
           MIN_DELAY: "30"
           MAX_DELAY: "90"
+          # --- уведомления ---
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set +e
           python oci_arm_retry.py
           rc=$?
-          # rc=0  -> SUCCESS (инстанс создан) — отключаем workflow, чтобы не тратить минуты впустую.
-          # rc=1  -> таймаут / лимит попыток (нет ёмкости), просто завершаемся успешно — повторим через 10 мин.
-          # rc=2  -> фатальная ошибка конфигурации (auth, OCID), упасть и подсветить.
-          # rc=3  -> LimitExceeded, тоже фатально.
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # 0 -> инстанс создан
+          # 1 -> ёмкости нет, это нормальный исход, ждём следующий тик
+          # 2 -> ошибка конфигурации (auth/OCID) -- падаем громко
+          # 3 -> Always Free квота исчерпана -- падаем громко
           case $rc in
-            0)
-              echo "Instance launched. Disabling further runs."
-              # Отключим workflow, чтобы не запускался каждые 10 минут впустую.
-              # Нужно дать токену permission: actions:write — см. permissions ниже.
-              ;;
-            1)
-              echo "No capacity yet, will retry next cron tick."
-              exit 0
-              ;;
-            *)
-              exit $rc
-              ;;
+            0) echo "::notice::Инстанс создан" ;;
+            1) echo "::notice::Капасити нет, повторим по расписанию"; rc=0 ;;
           esac
+          exit $rc
 
-    permissions:
-      actions: write
-      contents: read
+      - name: Отключить расписание после успеха
+        if: steps.hunt.outputs.rc == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PUT \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/oci-retry.yml/disable" \
+            && echo "Расписание отключено." \
+            || echo "Не смог отключить автоматически -- сделай это кнопкой в Actions."

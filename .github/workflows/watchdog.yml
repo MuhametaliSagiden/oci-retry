@@ -1,0 +1,56 @@
+name: TorrServer watchdog
+
+# Раз в сутки проверяет, что сервер жив и сертификат валиден.
+# Если лёг -- пишет в Telegram. Стоит ~1 минуту Actions в день.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Пинг TorrServer
+        env:
+          DUCKDNS_SUBDOMAIN: ${{ secrets.DUCKDNS_SUBDOMAIN }}
+          TS_DOMAIN: ${{ vars.TS_DOMAIN }}
+          TS_USER: ${{ secrets.TS_USER }}
+          TS_PASS: ${{ secrets.TS_PASS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -u
+          DOMAIN="${TS_DOMAIN:-}"
+          if [ -z "$DOMAIN" ] && [ -n "${DUCKDNS_SUBDOMAIN:-}" ]; then
+            case "$DUCKDNS_SUBDOMAIN" in
+              *.*) DOMAIN="$DUCKDNS_SUBDOMAIN" ;;
+              *)   DOMAIN="${DUCKDNS_SUBDOMAIN}.duckdns.org" ;;
+            esac
+          fi
+          if [ -z "$DOMAIN" ]; then
+            echo "::notice::Домен не задан, проверять нечего"
+            exit 0
+          fi
+
+          URL="https://${DOMAIN}/echo"
+          echo "GET $URL"
+          code=$(curl -s -o /tmp/body -w '%{http_code}' -m 20 \
+                 -u "${TS_USER}:${TS_PASS}" "$URL" || echo 000)
+          echo "HTTP $code / version: $(head -c 80 /tmp/body)"
+
+          if [ "$code" = "200" ]; then
+            echo "::notice::TorrServer жив ($DOMAIN)"
+            exit 0
+          fi
+
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            curl -fsS -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              -d "text=TorrServer не отвечает: https://${DOMAIN}/echo вернул ${code}" \
+              >/dev/null || true
+          fi
+          echo "::error::TorrServer недоступен (HTTP $code)"
+          exit 1

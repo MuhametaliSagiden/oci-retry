@@ -1,6 +1,5 @@
 .env
-.venv/
 __pycache__/
 *.pyc
-~/.oci/
-oci_api_key.pem
+*.pem
+.oci/
