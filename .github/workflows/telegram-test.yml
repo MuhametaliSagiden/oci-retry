@@ -30,13 +30,12 @@ jobs:
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || echo 000)
           if [ "$me_code" != "200" ]; then
             echo "::error::getMe вернул HTTP ${me_code}. Скорее всего неверный TELEGRAM_BOT_TOKEN."
-            sed -e 's/[0-9]\{6,\}:[A-Za-z0-9_-]*/<token>/g' /tmp/me.json
             exit 1
           fi
           bot=$(jq -r '.result.username // "unknown"' /tmp/me.json)
-          echo "Бот ответил: @${bot}"
+          echo "Бот отвечает: @${bot}"
 
-          # --- 2. Собираем такое же сообщение, как при реальной поимке ---
+          # --- 2. Домен, который попадёт в уведомление ---
           DOMAIN="${TS_DOMAIN:-}"
           if [ -z "$DOMAIN" ] && [ -n "${DUCKDNS_SUBDOMAIN:-}" ]; then
             case "$DUCKDNS_SUBDOMAIN" in
@@ -46,10 +45,13 @@ jobs:
           fi
           [ -n "$DOMAIN" ] || DOMAIN="(домен не задан)"
 
-          TEXT="Тест уведомлений oci-retry.
-Если ты видишь это сообщение, то уведомление о поимке инстанса тоже дойдёт.
-Адрес будет таким: https://${DOMAIN}
-Сам инстанс ещё НЕ пойман, охота идёт."
+          # printf, а не многострочная переменная: перевод строки внутри YAML-блока
+          # ломает отступы и валит парсер workflow.
+          TEXT=$(printf '%s\n%s\n%s\n%s' \
+            "Тест уведомлений oci-retry." \
+            "Если ты видишь это сообщение, уведомление о поимке инстанса тоже дойдёт." \
+            "Адрес будет таким: https://${DOMAIN}" \
+            "Сам инстанс ещё НЕ пойман, охота идёт.")
 
           # --- 3. Шлём ---
           code=$(curl -s -o /tmp/send.json -w '%{http_code}' -m 20 \
