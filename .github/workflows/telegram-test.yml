@@ -1,0 +1,88 @@
+name: Проверить Telegram
+
+# Ручная проверка, что бот дойдёт до тебя РАНЬШЕ, чем поймается инстанс.
+# Использует те же секреты и тот же вызов sendMessage, что и oci_arm_retry.py,
+# так что зелёный ран здесь значит, что и боевое уведомление дойдёт.
+on:
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Отправить тестовое сообщение
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DUCKDNS_SUBDOMAIN: ${{ secrets.DUCKDNS_SUBDOMAIN }}
+          TS_DOMAIN: ${{ vars.TS_DOMAIN }}
+        run: |
+          set -u
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::error::Не заданы секреты TELEGRAM_BOT_TOKEN и/или TELEGRAM_CHAT_ID"
+            exit 1
+          fi
+
+          # --- 1. Жив ли сам бот (проверяет только токен) ---
+          me_code=$(curl -s -o /tmp/me.json -w '%{http_code}' -m 15 \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || echo 000)
+          if [ "$me_code" != "200" ]; then
+            echo "::error::getMe вернул HTTP ${me_code}. Скорее всего неверный TELEGRAM_BOT_TOKEN."
+            sed -e 's/[0-9]\{6,\}:[A-Za-z0-9_-]*/<token>/g' /tmp/me.json
+            exit 1
+          fi
+          bot=$(jq -r '.result.username // "unknown"' /tmp/me.json)
+          echo "Бот ответил: @${bot}"
+
+          # --- 2. Собираем такое же сообщение, как при реальной поимке ---
+          DOMAIN="${TS_DOMAIN:-}"
+          if [ -z "$DOMAIN" ] && [ -n "${DUCKDNS_SUBDOMAIN:-}" ]; then
+            case "$DUCKDNS_SUBDOMAIN" in
+              *.*) DOMAIN="$DUCKDNS_SUBDOMAIN" ;;
+              *)   DOMAIN="${DUCKDNS_SUBDOMAIN}.duckdns.org" ;;
+            esac
+          fi
+          [ -n "$DOMAIN" ] || DOMAIN="(домен не задан)"
+
+          TEXT="Тест уведомлений oci-retry.
+Если ты видишь это сообщение, то уведомление о поимке инстанса тоже дойдёт.
+Адрес будет таким: https://${DOMAIN}
+Сам инстанс ещё НЕ пойман, охота идёт."
+
+          # --- 3. Шлём ---
+          code=$(curl -s -o /tmp/send.json -w '%{http_code}' -m 20 \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" || echo 000)
+
+          if [ "$code" = "200" ]; then
+            echo "::notice::Сообщение отправлено. Проверяй Telegram."
+            {
+              echo "## Telegram работает"
+              echo ""
+              echo "Бот: @${bot}"
+              echo "Адрес в уведомлении: https://${DOMAIN}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          desc=$(jq -r '.description // ""' /tmp/send.json 2>/dev/null)
+          echo "HTTP ${code}: ${desc}"
+
+          case "$code" in
+            400)
+              echo "::error::Telegram не нашёл чат. Проверь TELEGRAM_CHAT_ID: это числовой id, а не @username. Узнать свой id можно у @userinfobot."
+              ;;
+            401)
+              echo "::error::Неверный TELEGRAM_BOT_TOKEN."
+              ;;
+            403)
+              echo "::error::Бот не может писать тебе. Открой чат с ботом и нажми Start (для группы -- добавь бота в группу)."
+              ;;
+            *)
+              echo "::error::sendMessage вернул HTTP ${code}."
+              ;;
+          esac
+          exit 1
