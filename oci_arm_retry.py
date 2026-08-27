@@ -8,7 +8,8 @@ oci_arm_retry.py
 
 Что делает за тебя:
   1. подтягивает свежий образ Ubuntu под нужную архитектуру;
-  2. создаёт VCN, публичный сабнет, Internet Gateway и открывает порты;
+  2. готовит сеть: переиспользует существующую VCN/сабнет или создаёт свою,
+     вешает Internet Gateway и открывает порты;
   3. по кругу дёргает launch_instance по всем Availability Domains региона,
      перебирая план shape'ов (сначала ARM, при желании -- fallback на AMD micro);
   4. передаёт cloud-init, который на первом же бутe ставит Docker, TorrServer,
@@ -60,7 +61,7 @@ SSH_PUBLIC_KEY = os.getenv("OCI_SSH_PUBLIC_KEY", "").strip()
 
 # ----- Где запускаем -----
 COMPARTMENT_ID = os.getenv("OCI_COMPARTMENT_ID", "").strip()  # пусто -> root (tenancy)
-SUBNET_ID = os.getenv("OCI_SUBNET_ID", "").strip()            # пусто -> создадим сами
+SUBNET_ID = os.getenv("OCI_SUBNET_ID", "").strip()            # пусто -> подготовим сами
 IMAGE_ID = os.getenv("OCI_IMAGE_ID", "").strip()              # пусто -> найдём сами
 AVAILABILITY_DOMAINS = os.getenv("OCI_AVAILABILITY_DOMAINS", "").strip()
 
@@ -262,7 +263,13 @@ def main() -> int:
         except ServiceError as e:
             log.error("Network bootstrap failed: status=%s code=%s message=%s",
                       e.status, e.code, e.message)
+            notify_telegram(f"OCI network bootstrap FAILED: {e.code} -- {e.message}")
             return 2
+        except Exception as exc:  # noqa: BLE001
+            log.error("Network bootstrap failed: %s", exc)
+            notify_telegram(f"OCI network bootstrap FAILED: {exc}")
+            return 2
+        log.info("Using subnet %s", SUBNET_ID)
 
     # --- образы под каждый shape ---
     images: dict = {}
